@@ -76,6 +76,10 @@ let outputChannel: OutputChannel | undefined
 let statusBarItem: StatusBarItem | undefined
 // Diagnostic cache is now per-folder
 const diagnosticCaches: Map<string, Map<string, Diagnostic[]>> = new Map()
+// Track FileSystemWatchers per folder for proper disposal
+const folderWatchers: Map<string, Disposable[]> = new Map()
+// Prevent race conditions when starting servers
+const pendingStarts: Set<string> = new Set()
 
 // Legacy export for backward compatibility (returns first client or null)
 export function getLanguageClient (): LanguageClient | null {
@@ -85,6 +89,11 @@ export function getLanguageClient (): LanguageClient | null {
 
 function getFolderKey (folder: WorkspaceFolder): string {
   return folder.uri.toString()
+}
+
+// Normalize path for glob patterns (Windows uses backslashes which don't work in globs)
+function normalizePathForGlob (fsPath: string): string {
+  return fsPath.replace(/\\/g, '/')
 }
 
 function getWorkspaceFolderForDocument (document: TextDocument): WorkspaceFolder | undefined {
@@ -308,11 +317,22 @@ async function buildExecutable (folder: WorkspaceFolder): Promise<Executable | u
 
 function buildLanguageClientOptions (folder: WorkspaceFolder): LanguageClientOptions {
   const diagnosticCache = getDiagnosticCache(folder)
+  const key = getFolderKey(folder)
+  // Normalize path for glob patterns (Windows backslashes break globs)
+  const globPath = normalizePathForGlob(folder.uri.fsPath)
+
+  // Create watchers and track them for disposal
+  const watchers = [
+    workspace.createFileSystemWatcher(`${globPath}/**/.standard.yml`),
+    workspace.createFileSystemWatcher(`${globPath}/**/.standard_todo.yml`),
+    workspace.createFileSystemWatcher(`${globPath}/**/Gemfile.lock`)
+  ]
+  folderWatchers.set(key, watchers)
 
   return {
     documentSelector: [
-      { scheme: 'file', language: 'ruby', pattern: `${folder.uri.fsPath}/**/*` },
-      { scheme: 'file', pattern: `${folder.uri.fsPath}/**/Gemfile` }
+      { scheme: 'file', language: 'ruby', pattern: `${globPath}/**/*` },
+      { scheme: 'file', pattern: `${globPath}/**/Gemfile` }
     ],
     diagnosticCollectionName: `standardRuby-${folder.name}`,
     workspaceFolder: folder,
@@ -323,11 +343,7 @@ function buildLanguageClientOptions (folder: WorkspaceFolder): LanguageClientOpt
     revealOutputChannelOn: RevealOutputChannelOn.Never,
     outputChannel,
     synchronize: {
-      fileEvents: [
-        workspace.createFileSystemWatcher(`${folder.uri.fsPath}/**/.standard.yml`),
-        workspace.createFileSystemWatcher(`${folder.uri.fsPath}/**/.standard_todo.yml`),
-        workspace.createFileSystemWatcher(`${folder.uri.fsPath}/**/Gemfile.lock`)
-      ]
+      fileEvents: watchers
     },
     middleware: {
       provideDocumentFormattingEdits: (document, options, token, next): ProviderResult<TextEdit[]> => {
@@ -429,13 +445,17 @@ async function startLanguageServerForFolder (folder: WorkspaceFolder): Promise<v
   // Already running for this folder
   if (languageClients.has(key)) return
 
-  // Check if we should enable for this folder
-  if (!(await shouldEnableForFolder(folder))) {
-    log(`Skipping workspace folder "${folder.name}" - extension disabled or not applicable`)
-    return
-  }
+  // Prevent race condition: if start is already in progress, skip
+  if (pendingStarts.has(key)) return
+  pendingStarts.add(key)
 
   try {
+    // Check if we should enable for this folder
+    if (!(await shouldEnableForFolder(folder))) {
+      log(`Skipping workspace folder "${folder.name}" - extension disabled or not applicable`)
+      return
+    }
+
     const client = await createLanguageClient(folder)
     if (client != null) {
       languageClients.set(key, client)
@@ -445,10 +465,18 @@ async function startLanguageServerForFolder (folder: WorkspaceFolder): Promise<v
     }
   } catch (error) {
     languageClients.delete(key)
+    // Clean up watchers if start failed
+    const watchers = folderWatchers.get(key)
+    if (watchers != null) {
+      watchers.forEach(w => w.dispose())
+      folderWatchers.delete(key)
+    }
     log(`Failed to start language server for "${folder.name}": ${String(error)}`)
     await displayError(
       `Failed to start Standard Ruby Language Server for "${folder.name}"`, ['Restart', 'Show Output']
     )
+  } finally {
+    pendingStarts.delete(key)
   }
 }
 
@@ -462,6 +490,13 @@ async function stopLanguageServerForFolder (folder: WorkspaceFolder): Promise<vo
   await client.stop()
   languageClients.delete(key)
   diagnosticCaches.delete(key)
+
+  // Dispose file system watchers (Issue #1: prevent watcher leak)
+  const watchers = folderWatchers.get(key)
+  if (watchers != null) {
+    watchers.forEach(w => w.dispose())
+    folderWatchers.delete(key)
+  }
 }
 
 async function startAllLanguageServers (): Promise<void> {
@@ -478,6 +513,12 @@ async function stopAllLanguageServers (): Promise<void> {
     languageClients.delete(key)
   }
   diagnosticCaches.clear()
+
+  // Dispose all file system watchers
+  for (const [key, watchers] of folderWatchers) {
+    watchers.forEach(w => w.dispose())
+    folderWatchers.delete(key)
+  }
 }
 
 async function restartAllLanguageServers (): Promise<void> {
