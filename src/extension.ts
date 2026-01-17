@@ -7,7 +7,6 @@ import {
   DiagnosticSeverity,
   ExtensionContext,
   OutputChannel,
-  TextDocument,
   WorkspaceFolder,
   commands,
   window,
@@ -20,7 +19,6 @@ import {
   StatusBarItem
 } from 'vscode'
 import {
-  DidOpenTextDocumentNotification,
   Disposable,
   Executable,
   ExecuteCommandRequest,
@@ -28,6 +26,7 @@ import {
   LanguageClientOptions,
   RevealOutputChannelOn
 } from 'vscode-languageclient/node'
+import { ClientManager, normalizePathForGlob } from './clientManager'
 
 class ExecError extends Error {
   command: string
@@ -70,50 +69,18 @@ const promiseExec = async function (command: string, options: { cwd: string }): 
   })
 }
 
-// Multi-root workspace support: one language client per workspace folder
-export const languageClients: Map<string, LanguageClient> = new Map()
+// Multi-root workspace support via ClientManager
+let clientManager: ClientManager | null = null
 let outputChannel: OutputChannel | undefined
 let statusBarItem: StatusBarItem | undefined
-// Diagnostic cache is now per-folder
-const diagnosticCaches: Map<string, Map<string, Diagnostic[]>> = new Map()
-// Track FileSystemWatchers per folder for proper disposal
-const folderWatchers: Map<string, Disposable[]> = new Map()
-// Prevent race conditions when starting servers
-const pendingStarts: Set<string> = new Set()
 
-// Legacy export for backward compatibility (returns first client or null)
+// Backward compatibility exports
 export function getLanguageClient (): LanguageClient | null {
-  const firstClient = languageClients.values().next().value
-  return firstClient ?? null
+  return clientManager?.getFirstClient() ?? null
 }
-
-function getFolderKey (folder: WorkspaceFolder): string {
-  return folder.uri.toString()
-}
-
-// Normalize path for glob patterns (Windows uses backslashes which don't work in globs)
-function normalizePathForGlob (fsPath: string): string {
-  return fsPath.replace(/\\/g, '/')
-}
-
-function getWorkspaceFolderForDocument (document: TextDocument): WorkspaceFolder | undefined {
-  return workspace.getWorkspaceFolder(document.uri)
-}
-
-function getClientForDocument (document: TextDocument): LanguageClient | undefined {
-  const folder = getWorkspaceFolderForDocument(document)
-  if (folder == null) return undefined
-  return languageClients.get(getFolderKey(folder))
-}
-
-function getDiagnosticCache (folder: WorkspaceFolder): Map<string, Diagnostic[]> {
-  const key = getFolderKey(folder)
-  let cache = diagnosticCaches.get(key)
-  if (cache == null) {
-    cache = new Map()
-    diagnosticCaches.set(key, cache)
-  }
-  return cache
+export const languageClients = {
+  get size (): number { return clientManager?.size ?? 0 },
+  values (): IterableIterator<LanguageClient> { return clientManager?.values() ?? [].values() }
 }
 
 function log (s: string): void {
@@ -130,32 +97,26 @@ function supportedLanguage (languageId: string): boolean {
 
 function registerCommands (): Disposable[] {
   return [
-    commands.registerCommand('standardRuby.start', startAllLanguageServers),
-    commands.registerCommand('standardRuby.stop', stopAllLanguageServers),
-    commands.registerCommand('standardRuby.restart', restartAllLanguageServers),
+    commands.registerCommand('standardRuby.start', async () => clientManager?.startAll()),
+    commands.registerCommand('standardRuby.stop', async () => clientManager?.stopAll()),
+    commands.registerCommand('standardRuby.restart', async () => clientManager?.restartAll()),
     commands.registerCommand('standardRuby.showOutputChannel', () => outputChannel?.show()),
     commands.registerCommand('standardRuby.formatAutoFixes', formatAutoFixes)
   ]
 }
 
 function registerWorkspaceListeners (): Disposable[] {
-  return [
+  const listeners: Disposable[] = [
     workspace.onDidChangeConfiguration(async event => {
       if (event.affectsConfiguration('standardRuby')) {
-        await restartAllLanguageServers()
-      }
-    }),
-    workspace.onDidChangeWorkspaceFolders(async event => {
-      // Stop servers for removed folders
-      for (const folder of event.removed) {
-        await stopLanguageServerForFolder(folder)
-      }
-      // Start servers for added folders
-      for (const folder of event.added) {
-        await startLanguageServerForFolder(folder)
+        await clientManager?.restartAll()
       }
     })
   ]
+  if (clientManager != null) {
+    listeners.push(clientManager.createWorkspaceFolderListener())
+  }
+  return listeners
 }
 
 export enum BundleStatus {
@@ -316,18 +277,18 @@ async function buildExecutable (folder: WorkspaceFolder): Promise<Executable | u
 }
 
 function buildLanguageClientOptions (folder: WorkspaceFolder): LanguageClientOptions {
-  const diagnosticCache = getDiagnosticCache(folder)
-  const key = getFolderKey(folder)
-  // Normalize path for glob patterns (Windows backslashes break globs)
   const globPath = normalizePathForGlob(folder.uri.fsPath)
 
-  // Create watchers and track them for disposal
+  // Create watchers and register them with the client manager
   const watchers = [
     workspace.createFileSystemWatcher(`${globPath}/**/.standard.yml`),
     workspace.createFileSystemWatcher(`${globPath}/**/.standard_todo.yml`),
     workspace.createFileSystemWatcher(`${globPath}/**/Gemfile.lock`)
   ]
-  folderWatchers.set(key, watchers)
+  clientManager?.registerWatchers(folder, watchers)
+
+  // Get the diagnostic cache for this folder
+  const diagnosticCache = clientManager?.getDiagnosticCacheForFolder(folder) ?? new Map()
 
   return {
     documentSelector: [
@@ -378,7 +339,7 @@ async function displayError (message: string, actions: string[]): Promise<void> 
   const action = await window.showErrorMessage(message, ...actions)
   switch (action) {
     case 'Restart':
-      await restartAllLanguageServers()
+      await clientManager?.restartAll()
       break
     case 'Show Output':
       outputChannel?.show()
@@ -391,160 +352,21 @@ async function displayError (message: string, actions: string[]): Promise<void> 
   }
 }
 
-async function syncOpenDocumentsWithLanguageServer (client: LanguageClient, folder: WorkspaceFolder): Promise<void> {
-  for (const textDocument of workspace.textDocuments) {
-    if (supportedLanguage(textDocument.languageId)) {
-      const docFolder = getWorkspaceFolderForDocument(textDocument)
-      if (docFolder != null && getFolderKey(docFolder) === getFolderKey(folder)) {
-        await client.sendNotification(
-          DidOpenTextDocumentNotification.type,
-          client.code2ProtocolConverter.asOpenTextDocumentParams(textDocument)
-        )
-      }
-    }
-  }
-}
-
 async function handleActiveTextEditorChange (editor: TextEditor | undefined): Promise<void> {
-  if (editor == null) {
+  if (clientManager == null || editor == null) {
     updateStatusBar()
     return
   }
 
-  const client = getClientForDocument(editor.document)
-  if (client == null) {
-    updateStatusBar()
-    return
-  }
-
-  const folder = getWorkspaceFolderForDocument(editor.document)
-  if (folder == null) {
-    updateStatusBar()
-    return
-  }
-
-  const diagnosticCache = getDiagnosticCache(folder)
-  if (supportedLanguage(editor.document.languageId) && !diagnosticCache.has(editor.document.uri.toString())) {
-    await client.sendNotification(
-      DidOpenTextDocumentNotification.type,
-      client.code2ProtocolConverter.asOpenTextDocumentParams(editor.document)
-    )
-  }
+  await clientManager.notifyDocumentOpenIfNeeded(editor.document)
   updateStatusBar()
-}
-
-async function afterStartLanguageServer (client: LanguageClient, folder: WorkspaceFolder): Promise<void> {
-  diagnosticCaches.set(getFolderKey(folder), new Map())
-  await syncOpenDocumentsWithLanguageServer(client, folder)
-  updateStatusBar()
-}
-
-async function startLanguageServerForFolder (folder: WorkspaceFolder): Promise<void> {
-  const key = getFolderKey(folder)
-
-  // Already running for this folder
-  if (languageClients.has(key)) return
-
-  // Prevent race condition: if start is already in progress, skip
-  if (pendingStarts.has(key)) return
-  pendingStarts.add(key)
-
-  try {
-    // Check if we should enable for this folder
-    if (!(await shouldEnableForFolder(folder))) {
-      log(`Skipping workspace folder "${folder.name}" - extension disabled or not applicable`)
-      return
-    }
-
-    const client = await createLanguageClient(folder)
-    if (client != null) {
-      languageClients.set(key, client)
-      await client.start()
-      await afterStartLanguageServer(client, folder)
-      log(`Language server started for "${folder.name}"`)
-    }
-  } catch (error) {
-    languageClients.delete(key)
-    // Clean up watchers if start failed
-    const watchers = folderWatchers.get(key)
-    if (watchers != null) {
-      watchers.forEach(w => w.dispose())
-      folderWatchers.delete(key)
-    }
-    log(`Failed to start language server for "${folder.name}": ${String(error)}`)
-    await displayError(
-      `Failed to start Standard Ruby Language Server for "${folder.name}"`, ['Restart', 'Show Output']
-    )
-  } finally {
-    pendingStarts.delete(key)
-  }
-}
-
-async function stopLanguageServerForFolder (folder: WorkspaceFolder): Promise<void> {
-  const key = getFolderKey(folder)
-  const client = languageClients.get(key)
-
-  if (client == null) return
-
-  log(`Stopping language server for "${folder.name}"...`)
-  await client.stop()
-  languageClients.delete(key)
-  diagnosticCaches.delete(key)
-
-  // Dispose file system watchers (Issue #1: prevent watcher leak)
-  const watchers = folderWatchers.get(key)
-  if (watchers != null) {
-    watchers.forEach(w => w.dispose())
-    folderWatchers.delete(key)
-  }
-}
-
-async function startAllLanguageServers (): Promise<void> {
-  const folders = workspace.workspaceFolders ?? []
-  for (const folder of folders) {
-    await startLanguageServerForFolder(folder)
-  }
-}
-
-async function stopAllLanguageServers (): Promise<void> {
-  log('Stopping all language servers...')
-  for (const [key, client] of languageClients) {
-    await client.stop()
-    languageClients.delete(key)
-  }
-  diagnosticCaches.clear()
-
-  // Dispose all file system watchers
-  for (const [key, watchers] of folderWatchers) {
-    watchers.forEach(w => w.dispose())
-    folderWatchers.delete(key)
-  }
-}
-
-async function restartAllLanguageServers (): Promise<void> {
-  log('Restarting all language servers...')
-  await stopAllLanguageServers()
-  await startAllLanguageServers()
-}
-
-// Legacy function names for backward compatibility
-async function startLanguageServer (): Promise<void> {
-  await startAllLanguageServers()
-}
-
-async function stopLanguageServer (): Promise<void> {
-  await stopAllLanguageServers()
-}
-
-async function restartLanguageServer (): Promise<void> {
-  await restartAllLanguageServers()
 }
 
 async function formatAutoFixes (): Promise<void> {
   const editor = window.activeTextEditor
   if (editor == null || !supportedLanguage(editor.document.languageId)) return
 
-  const client = getClientForDocument(editor.document)
+  const client = clientManager?.getClient(editor.document)
   if (client == null) return
 
   try {
@@ -572,21 +394,18 @@ function updateStatusBar (): void {
   if (statusBarItem == null) return
   const editor = window.activeTextEditor
 
-  if (editor == null || !supportedLanguage(editor.document.languageId)) {
+  if (clientManager == null || editor == null || !supportedLanguage(editor.document.languageId)) {
     statusBarItem.hide()
     return
   }
 
-  const folder = getWorkspaceFolderForDocument(editor.document)
-  const client = folder != null ? languageClients.get(getFolderKey(folder)) : undefined
-
+  const client = clientManager.getClient(editor.document)
   if (client == null) {
     statusBarItem.hide()
     return
   }
 
-  const diagnosticCache = folder != null ? getDiagnosticCache(folder) : undefined
-  const diagnostics = diagnosticCache?.get(editor.document.uri.toString())
+  const diagnostics = clientManager.getDiagnostics(editor.document)
 
   if (diagnostics == null) {
     statusBarItem.tooltip = 'Standard Ruby'
@@ -624,6 +443,19 @@ function updateStatusBar (): void {
 export async function activate (context: ExtensionContext): Promise<void> {
   outputChannel = window.createOutputChannel('Standard Ruby')
   statusBarItem = createStatusBarItem()
+
+  // Initialize client manager for multi-root workspace support
+  clientManager = new ClientManager({
+    log,
+    createClient: createLanguageClient,
+    shouldEnableForFolder,
+    onError: async (message, _folder) => {
+      await displayError(message, ['Restart', 'Show Output'])
+    },
+    onStatusUpdate: updateStatusBar,
+    supportedLanguage
+  })
+
   window.onDidChangeActiveTextEditor(handleActiveTextEditorChange)
   context.subscriptions.push(
     outputChannel,
@@ -633,9 +465,9 @@ export async function activate (context: ExtensionContext): Promise<void> {
   )
 
   log('Activating Standard Ruby extension with multi-root workspace support')
-  await startAllLanguageServers()
+  await clientManager.startAll()
 }
 
 export async function deactivate (): Promise<void> {
-  await stopAllLanguageServers()
+  await clientManager?.stopAll()
 }
