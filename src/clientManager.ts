@@ -21,13 +21,25 @@ export interface ClientManagerOptions {
 
 /**
  * Manages multiple language clients for multi-root workspace support.
- * Each workspace folder gets its own language server instance.
+ *
+ * VS Code multi-root workspaces can contain folders with different Standard Ruby
+ * configurations (e.g., one folder using standard-rails plugin, another using plain
+ * standard). This class ensures each folder gets its own language server instance
+ * running with the correct configuration.
  */
 export class ClientManager {
+  // One language client per workspace folder, keyed by folder URI
   private readonly clients: Map<string, LanguageClient> = new Map()
+
+  // Diagnostic cache per folder - used by status bar and middleware
   private readonly diagnosticCaches: Map<string, Map<string, Diagnostic[]>> = new Map()
+
+  // Track file system watchers per folder so we can dispose them when stopping servers
   private readonly watchers: Map<string, Disposable[]> = new Map()
+
+  // Track folders with server start in progress to prevent race conditions
   private readonly pendingStarts: Set<string> = new Set()
+
   private readonly options: ClientManagerOptions
 
   constructor (options: ClientManagerOptions) {
@@ -44,11 +56,10 @@ export class ClientManager {
   }
 
   /**
-   * Get the first available client (for backward compatibility).
+   * Get the first available client.
    */
   getFirstClient (): LanguageClient | null {
-    const first = this.clients.values().next().value
-    return first ?? null
+    return this.clients.values().next().value ?? null
   }
 
   /**
@@ -71,12 +82,11 @@ export class ClientManager {
   getDiagnostics (document: TextDocument): Diagnostic[] | undefined {
     const folder = workspace.getWorkspaceFolder(document.uri)
     if (folder == null) return undefined
-    const cache = this.diagnosticCaches.get(this.getFolderKey(folder))
-    return cache?.get(document.uri.toString())
+    return this.diagnosticCaches.get(this.getFolderKey(folder))?.get(document.uri.toString())
   }
 
   /**
-   * Get the diagnostic cache for a folder (used by buildLanguageClientOptions).
+   * Get the diagnostic cache for a folder.
    */
   getDiagnosticCacheForFolder (folder: WorkspaceFolder): Map<string, Diagnostic[]> {
     const key = this.getFolderKey(folder)
@@ -89,7 +99,10 @@ export class ClientManager {
   }
 
   /**
-   * Register watchers for a folder (called by buildLanguageClientOptions).
+   * Register file system watchers for a folder.
+   *
+   * Watchers are tracked here so they can be properly disposed when a folder's
+   * language server is stopped, preventing resource leaks.
    */
   registerWatchers (folder: WorkspaceFolder, watcherDisposables: Disposable[]): void {
     this.watchers.set(this.getFolderKey(folder), watcherDisposables)
@@ -104,12 +117,13 @@ export class ClientManager {
     // Already running for this folder
     if (this.clients.has(key)) return
 
-    // Prevent race condition: if start is already in progress, skip
+    // Prevent race condition: startForFolder can be called multiple times concurrently
+    // (e.g., from workspace folder listener and manual start command). Without this
+    // guard, we could end up with duplicate servers for the same folder.
     if (this.pendingStarts.has(key)) return
     this.pendingStarts.add(key)
 
     try {
-      // Check if we should enable for this folder
       if (!(await this.options.shouldEnableForFolder(folder))) {
         this.options.log(`Skipping workspace folder "${folder.name}" - extension disabled or not applicable`)
         return
@@ -123,6 +137,7 @@ export class ClientManager {
         this.options.log(`Language server started for "${folder.name}"`)
       }
     } catch (error) {
+      // Clean up partial state on failure
       this.clients.delete(key)
       this.cleanupWatchers(key)
       this.options.log(`Failed to start language server for "${folder.name}": ${String(error)}`)
@@ -138,7 +153,6 @@ export class ClientManager {
   async stopForFolder (folder: WorkspaceFolder): Promise<void> {
     const key = this.getFolderKey(folder)
     const client = this.clients.get(key)
-
     if (client == null) return
 
     this.options.log(`Stopping language server for "${folder.name}"...`)
@@ -152,8 +166,7 @@ export class ClientManager {
    * Start language servers for all workspace folders.
    */
   async startAll (): Promise<void> {
-    const folders = workspace.workspaceFolders ?? []
-    for (const folder of folders) {
+    for (const folder of workspace.workspaceFolders ?? []) {
       await this.startForFolder(folder)
     }
   }
@@ -163,10 +176,10 @@ export class ClientManager {
    */
   async stopAll (): Promise<void> {
     this.options.log('Stopping all language servers...')
-    for (const [key, client] of this.clients) {
+    for (const client of this.clients.values()) {
       await client.stop()
-      this.clients.delete(key)
     }
+    this.clients.clear()
     this.diagnosticCaches.clear()
     this.cleanupAllWatchers()
   }
@@ -185,11 +198,9 @@ export class ClientManager {
    */
   createWorkspaceFolderListener (): Disposable {
     return workspace.onDidChangeWorkspaceFolders(async event => {
-      // Stop servers for removed folders
       for (const folder of event.removed) {
         await this.stopForFolder(folder)
       }
-      // Start servers for added folders
       for (const folder of event.added) {
         await this.startForFolder(folder)
       }
@@ -197,7 +208,11 @@ export class ClientManager {
   }
 
   /**
-   * Send a document open notification if needed (for editor change handling).
+   * Send a document open notification if needed.
+   *
+   * When the user switches to a document that the language server hasn't seen yet
+   * (not in the diagnostic cache), we notify the server so it can provide diagnostics.
+   * This handles the case where documents were opened before the server started.
    */
   async notifyDocumentOpenIfNeeded (document: TextDocument): Promise<void> {
     if (!this.options.supportedLanguage(document.languageId)) return
@@ -208,6 +223,8 @@ export class ClientManager {
     const client = this.clients.get(this.getFolderKey(folder))
     if (client == null) return
 
+    // If we haven't received diagnostics for this document, the server doesn't know
+    // about it yet. Send an open notification so the server can lint it.
     const cache = this.getDiagnosticCacheForFolder(folder)
     if (!cache.has(document.uri.toString())) {
       await client.sendNotification(
@@ -216,8 +233,6 @@ export class ClientManager {
       )
     }
   }
-
-  // Private helpers
 
   private getFolderKey (folder: WorkspaceFolder): string {
     return folder.uri.toString()
@@ -229,39 +244,47 @@ export class ClientManager {
     this.options.onStatusUpdate()
   }
 
+  /**
+   * Notify the language server about all documents that are already open in this folder.
+   *
+   * When a language server starts, it doesn't know about documents that were opened
+   * before it was running. This method sends open notifications for all such documents
+   * so the server can provide immediate diagnostics without waiting for the user to
+   * edit or switch tabs.
+   */
   private async syncOpenDocuments (client: LanguageClient, folder: WorkspaceFolder): Promise<void> {
     const key = this.getFolderKey(folder)
     for (const doc of workspace.textDocuments) {
-      if (this.options.supportedLanguage(doc.languageId)) {
-        const docFolder = workspace.getWorkspaceFolder(doc.uri)
-        if (docFolder != null && this.getFolderKey(docFolder) === key) {
-          await client.sendNotification(
-            DidOpenTextDocumentNotification.type,
-            client.code2ProtocolConverter.asOpenTextDocumentParams(doc)
-          )
-        }
+      if (!this.options.supportedLanguage(doc.languageId)) continue
+      const docFolder = workspace.getWorkspaceFolder(doc.uri)
+      if (docFolder != null && this.getFolderKey(docFolder) === key) {
+        await client.sendNotification(
+          DidOpenTextDocumentNotification.type,
+          client.code2ProtocolConverter.asOpenTextDocumentParams(doc)
+        )
       }
     }
   }
 
   private cleanupWatchers (key: string): void {
-    const watcherList = this.watchers.get(key)
-    if (watcherList != null) {
-      watcherList.forEach(w => w.dispose())
-      this.watchers.delete(key)
-    }
+    this.watchers.get(key)?.forEach(w => w.dispose())
+    this.watchers.delete(key)
   }
 
   private cleanupAllWatchers (): void {
-    for (const [key, watcherList] of this.watchers) {
+    for (const watcherList of this.watchers.values()) {
       watcherList.forEach(w => w.dispose())
-      this.watchers.delete(key)
     }
+    this.watchers.clear()
   }
 }
 
 /**
- * Normalize path for glob patterns (Windows uses backslashes which don't work in globs).
+ * Normalize path for glob patterns.
+ *
+ * Windows uses backslashes in file paths (C:\Users\...) but glob patterns require
+ * forward slashes to work correctly. This function converts backslashes to forward
+ * slashes so globs work cross-platform.
  */
 export function normalizePathForGlob (fsPath: string): string {
   return fsPath.replace(/\\/g, '/')
