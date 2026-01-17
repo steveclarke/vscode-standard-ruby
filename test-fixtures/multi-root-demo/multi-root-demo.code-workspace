@@ -5,8 +5,8 @@
       "path": "app-rails"
     },
     {
-      "name": "cli-tool",
-      "path": "cli-tool"
+      "name": "ruby-lib",
+      "path": "ruby-lib"
     }
   ],
 
