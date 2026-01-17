@@ -257,12 +257,12 @@ export class ClientManager {
     for (const doc of workspace.textDocuments) {
       if (!this.options.supportedLanguage(doc.languageId)) continue
       const docFolder = workspace.getWorkspaceFolder(doc.uri)
-      if (docFolder != null && this.getFolderKey(docFolder) === key) {
-        await client.sendNotification(
-          DidOpenTextDocumentNotification.type,
-          client.code2ProtocolConverter.asOpenTextDocumentParams(doc)
-        )
-      }
+      if (docFolder == null || this.getFolderKey(docFolder) !== key) continue
+
+      await client.sendNotification(
+        DidOpenTextDocumentNotification.type,
+        client.code2ProtocolConverter.asOpenTextDocumentParams(doc)
+      )
     }
   }
 

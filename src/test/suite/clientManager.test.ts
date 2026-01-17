@@ -2,32 +2,31 @@ import * as assert from 'assert'
 import { Uri } from 'vscode'
 import { ClientManager, ClientManagerOptions, normalizePathForGlob } from '../../clientManager'
 
-// Mock WorkspaceFolder
 function createMockFolder (name: string, fsPath: string): any {
-  return {
-    name,
-    uri: Uri.file(fsPath),
-    index: 0
-  }
+  return { name, uri: Uri.file(fsPath), index: 0 }
 }
 
-// Mock LanguageClient
-function createMockClient (): any {
+function createMockClient (overrides: any = {}): any {
   return {
     start: async () => {},
     stop: async () => {},
     sendNotification: async () => {},
     code2ProtocolConverter: {
       asOpenTextDocumentParams: (doc: any) => ({ textDocument: { uri: doc.uri.toString() } })
-    }
+    },
+    ...overrides
   }
 }
 
-// Mock TextDocument
-function createMockDocument (uri: string, languageId: string = 'ruby'): any {
+function createOptions (overrides: Partial<ClientManagerOptions> = {}): ClientManagerOptions {
   return {
-    uri: Uri.parse(uri),
-    languageId
+    log: () => {},
+    createClient: async () => createMockClient(),
+    shouldEnableForFolder: async () => true,
+    onError: async () => {},
+    onStatusUpdate: () => {},
+    supportedLanguage: (id) => id === 'ruby',
+    ...overrides
   }
 }
 
@@ -58,22 +57,14 @@ suite('ClientManager', () => {
   suite('client lifecycle', () => {
     test('startForFolder creates a client for the folder', async () => {
       const folder = createMockFolder('my-app', '/workspace/my-app')
-      const mockClient = createMockClient()
       let clientCreated = false
 
-      const options: ClientManagerOptions = {
-        log: () => {},
+      const manager = new ClientManager(createOptions({
         createClient: async () => {
           clientCreated = true
-          return mockClient
-        },
-        shouldEnableForFolder: async () => true,
-        onError: async () => {},
-        onStatusUpdate: () => {},
-        supportedLanguage: (id) => id === 'ruby'
-      }
-
-      const manager = new ClientManager(options)
+          return createMockClient()
+        }
+      }))
       await manager.startForFolder(folder)
 
       assert.strictEqual(clientCreated, true)
@@ -84,19 +75,13 @@ suite('ClientManager', () => {
       const folder = createMockFolder('my-app', '/workspace/my-app')
       let clientCreated = false
 
-      const options: ClientManagerOptions = {
-        log: () => {},
+      const manager = new ClientManager(createOptions({
         createClient: async () => {
           clientCreated = true
           return createMockClient()
         },
-        shouldEnableForFolder: async () => false,
-        onError: async () => {},
-        onStatusUpdate: () => {},
-        supportedLanguage: (id) => id === 'ruby'
-      }
-
-      const manager = new ClientManager(options)
+        shouldEnableForFolder: async () => false
+      }))
       await manager.startForFolder(folder)
 
       assert.strictEqual(clientCreated, false)
@@ -107,19 +92,12 @@ suite('ClientManager', () => {
       const folder = createMockFolder('my-app', '/workspace/my-app')
       let createCount = 0
 
-      const options: ClientManagerOptions = {
-        log: () => {},
+      const manager = new ClientManager(createOptions({
         createClient: async () => {
           createCount++
           return createMockClient()
-        },
-        shouldEnableForFolder: async () => true,
-        onError: async () => {},
-        onStatusUpdate: () => {},
-        supportedLanguage: (id) => id === 'ruby'
-      }
-
-      const manager = new ClientManager(options)
+        }
+      }))
       await manager.startForFolder(folder)
       await manager.startForFolder(folder)
 
@@ -130,21 +108,10 @@ suite('ClientManager', () => {
     test('stopForFolder removes the client', async () => {
       const folder = createMockFolder('my-app', '/workspace/my-app')
       let stopCalled = false
-      const mockClient = {
-        ...createMockClient(),
-        stop: async () => { stopCalled = true }
-      }
 
-      const options: ClientManagerOptions = {
-        log: () => {},
-        createClient: async () => mockClient,
-        shouldEnableForFolder: async () => true,
-        onError: async () => {},
-        onStatusUpdate: () => {},
-        supportedLanguage: (id) => id === 'ruby'
-      }
-
-      const manager = new ClientManager(options)
+      const manager = new ClientManager(createOptions({
+        createClient: async () => createMockClient({ stop: async () => { stopCalled = true } })
+      }))
       await manager.startForFolder(folder)
       assert.strictEqual(manager.size, 1)
 
@@ -159,23 +126,14 @@ suite('ClientManager', () => {
       const folder = createMockFolder('my-app', '/workspace/my-app')
       let createCount = 0
 
-      const options: ClientManagerOptions = {
-        log: () => {},
+      const manager = new ClientManager(createOptions({
         createClient: async () => {
           createCount++
-          // Simulate some async work
           await new Promise(resolve => setTimeout(resolve, 10))
           return createMockClient()
-        },
-        shouldEnableForFolder: async () => true,
-        onError: async () => {},
-        onStatusUpdate: () => {},
-        supportedLanguage: (id) => id === 'ruby'
-      }
+        }
+      }))
 
-      const manager = new ClientManager(options)
-
-      // Start two concurrent calls
       await Promise.all([
         manager.startForFolder(folder),
         manager.startForFolder(folder)
@@ -190,27 +148,19 @@ suite('ClientManager', () => {
     test('manages separate clients for different folders', async () => {
       const folder1 = createMockFolder('rails-app', '/workspace/rails-app')
       const folder2 = createMockFolder('cli-tool', '/workspace/cli-tool')
-      const clients: any[] = []
+      let clientCount = 0
 
-      const options: ClientManagerOptions = {
-        log: () => {},
+      const manager = new ClientManager(createOptions({
         createClient: async () => {
-          const client = createMockClient()
-          clients.push(client)
-          return client
-        },
-        shouldEnableForFolder: async () => true,
-        onError: async () => {},
-        onStatusUpdate: () => {},
-        supportedLanguage: (id) => id === 'ruby'
-      }
-
-      const manager = new ClientManager(options)
+          clientCount++
+          return createMockClient()
+        }
+      }))
       await manager.startForFolder(folder1)
       await manager.startForFolder(folder2)
 
       assert.strictEqual(manager.size, 2)
-      assert.strictEqual(clients.length, 2)
+      assert.strictEqual(clientCount, 2)
     })
 
     test('stopAll stops all clients', async () => {
@@ -218,19 +168,9 @@ suite('ClientManager', () => {
       const folder2 = createMockFolder('cli-tool', '/workspace/cli-tool')
       let stopCount = 0
 
-      const options: ClientManagerOptions = {
-        log: () => {},
-        createClient: async () => ({
-          ...createMockClient(),
-          stop: async () => { stopCount++ }
-        }),
-        shouldEnableForFolder: async () => true,
-        onError: async () => {},
-        onStatusUpdate: () => {},
-        supportedLanguage: (id) => id === 'ruby'
-      }
-
-      const manager = new ClientManager(options)
+      const manager = new ClientManager(createOptions({
+        createClient: async () => createMockClient({ stop: async () => { stopCount++ } })
+      }))
       await manager.startForFolder(folder1)
       await manager.startForFolder(folder2)
       assert.strictEqual(manager.size, 2)
@@ -244,17 +184,8 @@ suite('ClientManager', () => {
   suite('diagnostic cache', () => {
     test('getDiagnosticCacheForFolder returns consistent cache', async () => {
       const folder = createMockFolder('my-app', '/workspace/my-app')
+      const manager = new ClientManager(createOptions())
 
-      const options: ClientManagerOptions = {
-        log: () => {},
-        createClient: async () => createMockClient(),
-        shouldEnableForFolder: async () => true,
-        onError: async () => {},
-        onStatusUpdate: () => {},
-        supportedLanguage: (id) => id === 'ruby'
-      }
-
-      const manager = new ClientManager(options)
       const cache1 = manager.getDiagnosticCacheForFolder(folder)
       const cache2 = manager.getDiagnosticCacheForFolder(folder)
 
@@ -267,22 +198,9 @@ suite('ClientManager', () => {
       const folder = createMockFolder('my-app', '/workspace/my-app')
       let watcherDisposed = false
 
-      const options: ClientManagerOptions = {
-        log: () => {},
-        createClient: async () => createMockClient(),
-        shouldEnableForFolder: async () => true,
-        onError: async () => {},
-        onStatusUpdate: () => {},
-        supportedLanguage: (id) => id === 'ruby'
-      }
-
-      const manager = new ClientManager(options)
+      const manager = new ClientManager(createOptions())
       await manager.startForFolder(folder)
-
-      // Register a mock watcher
-      manager.registerWatchers(folder, [{
-        dispose: () => { watcherDisposed = true }
-      }])
+      manager.registerWatchers(folder, [{ dispose: () => { watcherDisposed = true } }])
 
       await manager.stopForFolder(folder)
       assert.strictEqual(watcherDisposed, true)
@@ -292,27 +210,14 @@ suite('ClientManager', () => {
   suite('error handling', () => {
     test('startForFolder calls onError when client creation fails', async () => {
       const folder = createMockFolder('my-app', '/workspace/my-app')
-      let errorCalled = false
       let errorMessage = ''
 
-      const options: ClientManagerOptions = {
-        log: () => {},
-        createClient: async () => {
-          throw new Error('Connection failed')
-        },
-        shouldEnableForFolder: async () => true,
-        onError: async (message) => {
-          errorCalled = true
-          errorMessage = message
-        },
-        onStatusUpdate: () => {},
-        supportedLanguage: (id) => id === 'ruby'
-      }
-
-      const manager = new ClientManager(options)
+      const manager = new ClientManager(createOptions({
+        createClient: async () => { throw new Error('Connection failed') },
+        onError: async (message) => { errorMessage = message }
+      }))
       await manager.startForFolder(folder)
 
-      assert.strictEqual(errorCalled, true)
       assert.ok(errorMessage.includes('my-app'))
       assert.strictEqual(manager.size, 0)
     })
@@ -321,23 +226,10 @@ suite('ClientManager', () => {
       const folder = createMockFolder('my-app', '/workspace/my-app')
       let watcherDisposed = false
 
-      const options: ClientManagerOptions = {
-        log: () => {},
-        createClient: async () => {
-          throw new Error('Connection failed')
-        },
-        shouldEnableForFolder: async () => true,
-        onError: async () => {},
-        onStatusUpdate: () => {},
-        supportedLanguage: (id) => id === 'ruby'
-      }
-
-      const manager = new ClientManager(options)
-
-      // Pre-register watchers (simulating partial setup before failure)
-      manager.registerWatchers(folder, [{
-        dispose: () => { watcherDisposed = true }
-      }])
+      const manager = new ClientManager(createOptions({
+        createClient: async () => { throw new Error('Connection failed') }
+      }))
+      manager.registerWatchers(folder, [{ dispose: () => { watcherDisposed = true } }])
 
       await manager.startForFolder(folder)
 

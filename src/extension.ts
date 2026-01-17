@@ -3,7 +3,6 @@ import { homedir } from 'os'
 import * as path from 'path'
 import { satisfies } from 'semver'
 import {
-  Diagnostic,
   DiagnosticSeverity,
   ExtensionContext,
   OutputChannel,
@@ -97,9 +96,9 @@ function supportedLanguage (languageId: string): boolean {
 
 function registerCommands (): Disposable[] {
   return [
-    commands.registerCommand('standardRuby.start', async () => clientManager?.startAll()),
-    commands.registerCommand('standardRuby.stop', async () => clientManager?.stopAll()),
-    commands.registerCommand('standardRuby.restart', async () => clientManager?.restartAll()),
+    commands.registerCommand('standardRuby.start', async () => await clientManager?.startAll()),
+    commands.registerCommand('standardRuby.stop', async () => await clientManager?.stopAll()),
+    commands.registerCommand('standardRuby.restart', async () => await clientManager?.restartAll()),
     commands.registerCommand('standardRuby.showOutputChannel', () => outputChannel?.show()),
     commands.registerCommand('standardRuby.formatAutoFixes', formatAutoFixes)
   ]
