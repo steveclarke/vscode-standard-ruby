@@ -74,7 +74,7 @@ let clientManager: ClientManager | null = null
 let outputChannel: OutputChannel | undefined
 let statusBarItem: StatusBarItem | undefined
 
-// Backward compatibility exports
+// Public API for accessing language clients
 export function getLanguageClient (): LanguageClient | null {
   return clientManager?.getFirstClient() ?? null
 }
